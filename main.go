@@ -85,7 +85,6 @@ func main() {
 
 		attempt := 1
 		client := &http.Client{Transport: proxy.Tr}
-		log.Printf("%s -> %d / tag: %s", ctx.Req.URL.String(), resp.StatusCode, resp.Header.Get("X-Proxy-Tag"))
 
 		for resp.StatusCode >= 400 && attempt <= MAX_RETRIES {
 			newReq := ctx.Req.Clone(ctx.Req.Context())
@@ -130,7 +129,6 @@ func findProxy(xrayLog *os.File, urlStr string) (string, error) {
 			return "", err
 		}
 		strLine := string(line)
-		log.Println("LINE:::::: ", strLine)
 
 		if strings.Contains(strLine, urlStr) {
 			tagMatch := reTag.FindStringSubmatch(strLine)
