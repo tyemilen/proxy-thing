@@ -1,13 +1,10 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
-	"errors"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"net/url"
@@ -21,6 +18,7 @@ import (
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/serial"
+	"github.com/xtls/xray-core/common/uuid"
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/proxy/vless"
 	"github.com/xtls/xray-core/proxy/vless/outbound"
@@ -51,18 +49,19 @@ func main() {
 	upstream, _ := url.Parse(xrayURL)
 
 	proxy := goproxy.NewProxyHttpServer()
-	proxy.Verbose = false
+	proxy.Verbose = true
 
 	proxy.Tr = &http.Transport{
-		Proxy:           http.ProxyURL(upstream),
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		Proxy:             http.ProxyURL(upstream),
+		TLSClientConfig:   &tls.Config{InsecureSkipVerify: true},
+		DisableKeepAlives: true,
 	}
 
 	proxy.ConnectDial = proxy.NewConnectDialToProxy(xrayURL)
 
 	proxy.OnRequest().HandleConnect(goproxy.AlwaysMitm)
 
-	xrayLog, err := os.Open("/var/log/xray/error.log")
+	xrayLog, err := os.Open("/var/log/xray/access.log")
 
 	if err != nil {
 		log.Fatal(err)
@@ -70,22 +69,43 @@ func main() {
 
 	defer xrayLog.Close()
 
+	proxy.OnRequest().DoFunc(func(req *http.Request, ctx *goproxy.ProxyCtx) (*http.Request, *http.Response) {
+		q := req.URL.Query()
+		q.Set("ysclid", fmt.Sprintf("%s-%s", uuid.New(), uuid.New()))
+		req.URL.RawQuery = q.Encode()
+
+		return req, nil
+	})
+
+	MAX_RETRIES := 5
 	proxy.OnResponse().DoFunc(func(resp *http.Response, ctx *goproxy.ProxyCtx) *http.Response {
-		if resp != nil {
-			// addNew()
-			log.Printf("[%s] %s -> %d %s", ctx.Req.Method, ctx.Req.URL.Host, resp.StatusCode, resp.Status)
-
-			if resp.StatusCode >= 400 {
-				urlStr := ctx.Req.URL.String()
-				tag, err := findProxy(xrayLog, ctx.Req.URL.String())
-
-				if err != nil {
-					log.Printf("err %s -> %s", urlStr, err)
-				} else {
-					log.Printf("%s -> %s", urlStr, tag)
-				}
-			}
+		if resp == nil {
+			return resp
 		}
+
+		attempt := 1
+		client := &http.Client{Transport: proxy.Tr}
+		log.Printf("%s -> %d / tag: %s", ctx.Req.URL.String(), resp.StatusCode, resp.Header.Get("X-Proxy-Tag"))
+
+		for resp.StatusCode >= 400 && attempt <= MAX_RETRIES {
+			newReq := ctx.Req.Clone(ctx.Req.Context())
+			newReq.Header.Set("Connection", "close")
+			newResp, err := client.Do(newReq)
+			if err != nil {
+				break
+			}
+			tag, err := findProxy(xrayLog, ctx.Req.URL.String())
+
+			if err != nil {
+				break
+			}
+
+			log.Printf("[%s] %s -> %d retry %d", tag, ctx.Req.URL.String(), resp.StatusCode, attempt)
+
+			resp = newResp
+			attempt++
+		}
+
 		return resp
 	})
 
@@ -101,62 +121,25 @@ func findProxy(xrayLog *os.File, urlStr string) (string, error) {
 		return "", err
 	}
 
-	var id string
-	var urlPos int
-
-	reId := regexp.MustCompile(`\[Info\]\s+\[([^\]]+)\]`)
+	reTag := regexp.MustCompile(`\[http-in >>|\-> (.*)\]`)
 	xSize := xStat.Size()
 	scanner := backscanner.New(xrayLog, int(xSize))
 	for {
-		line, pos, err := scanner.LineBytes()
+		line, _, err := scanner.LineBytes()
 		if err != nil {
 			return "", err
 		}
 		strLine := string(line)
+		log.Println("LINE:::::: ", strLine)
+
 		if strings.Contains(strLine, urlStr) {
-			idMatch := reId.FindStringSubmatch(strLine)
+			tagMatch := reTag.FindStringSubmatch(strLine)
 
-			if len(idMatch) > 1 {
-				id = idMatch[1]
-				urlPos = pos
-				break
+			if len(tagMatch) > 1 {
+				return tagMatch[1], nil
 			}
 		}
 	}
-	if len(id) <= 0 {
-		return "", errors.New("id is empty")
-	}
-
-	pattern := fmt.Sprintf(`\[Info\]\s+\[%s\].*?detour\s+\[([^\]]+)\]`, regexp.QuoteMeta(id))
-	reProxy, err := regexp.Compile(pattern)
-
-	if err != nil {
-		return "", errors.New("bad regexp")
-	}
-
-	section := io.NewSectionReader(xrayLog, int64(urlPos), xSize-int64(urlPos))
-	fScanner := bufio.NewScanner(section)
-	linesRead := 0
-	for fScanner.Scan() {
-		if linesRead >= 500 {
-			return "", errors.New("cant find proxy tag")
-		}
-
-		line := fScanner.Text()
-
-		if strings.Contains(line, "["+id+"]") && strings.Contains(line, "taking detour") {
-			proxyMatch := reProxy.FindStringSubmatch(line)
-			if len(proxyMatch) > 1 {
-				proxyTag := proxyMatch[1]
-
-				return proxyTag, nil
-			}
-		}
-
-		linesRead++
-	}
-
-	return "", errors.New("=(")
 }
 
 func addNew() error {
