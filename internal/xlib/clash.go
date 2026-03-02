@@ -1,0 +1,501 @@
+package xlib
+
+import (
+	"fmt"
+
+	"gopkg.in/yaml.v3"
+
+	"github.com/xtls/xray-core/infra/conf"
+)
+
+// https://github.com/MetaCubeX/mihomo/blob/Alpha/docs/config.yaml
+
+type ClashYaml struct {
+	Proxies []ClashProxy `yaml:"proxies,omitempty"`
+}
+
+type ClashProxy struct {
+	Name       string `yaml:"name,omitempty"`
+	Type       string `yaml:"type,omitempty"`
+	Server     string `yaml:"server,omitempty"`
+	Port       uint16 `yaml:"port,omitempty"`
+	Uuid       string `yaml:"uuid,omitempty"`
+	Cipher     string `yaml:"cipher,omitempty"`
+	Username   string `yaml:"username,omitempty"`
+	Password   string `yaml:"password,omitempty"`
+	Encryption string `yaml:"encryption,omitempty"`
+
+	Ports        string `yaml:"ports,omitempty"`
+	HopInterval  int32  `yaml:"hop-interval,omitempty"`
+	Up           string `yaml:"up,omitempty"`
+	Down         string `yaml:"down,omitempty"`
+	Obfs         string `yaml:"obfs,omitempty"`
+	ObfsPassword string `yaml:"obfs-password,omitempty"`
+
+	Udp        bool `yaml:"udp,omitempty"`
+	UdpOverTcp bool `yaml:"udp-over-tcp,omitempty"`
+
+	Tls            bool     `yaml:"tls,omitempty"`
+	SkipCertVerify bool     `yaml:"skip-cert-verify,omitempty"`
+	Servername     string   `yaml:"servername,omitempty"`
+	Sni            string   `yaml:"sni,omitempty"`
+	Alpn           []string `yaml:"alpn,omitempty"`
+
+	Fingerprint       string                 `yaml:"fingerprint,omitempty"`
+	ClientFingerprint string                 `yaml:"client-fingerprint,omitempty"`
+	Flow              string                 `yaml:"flow,omitempty"`
+	RealityOpts       *ClashProxyRealityOpts `yaml:"reality-opts,omitempty"`
+
+	Network    string                `yaml:"network,omitempty"`
+	Plugin     string                `yaml:"plugin,omitempty"`
+	PluginOpts *ClashProxyPluginOpts `yaml:"plugin-opts,omitempty"`
+	EchOpts    *ClashProxyEchOpts    `yaml:"ech-opts,omitempty"`
+	WsOpts     *ClashProxyWsOpts     `yaml:"ws-opts,omitempty"`
+	GrpcOpts   *ClashProxyGrpcOpts   `yaml:"grpc-opts,omitempty"`
+}
+
+type ClashProxyEchOpts struct {
+	Enable bool   `yaml:"enable,omitempty"`
+	Config string `yaml:"config,omitempty"`
+}
+
+type ClashProxyRealityOpts struct {
+	PublicKey string `yaml:"public-key,omitempty"`
+	ShortId   string `yaml:"short-id,omitempty"`
+}
+
+type ClashProxyPluginOpts struct {
+	Mode           string             `yaml:"mode,omitempty"`
+	Tls            bool               `yaml:"tls,omitempty"`
+	Fingerprint    string             `yaml:"fingerprint,omitempty"`
+	EchOpts        *ClashProxyEchOpts `yaml:"ech-opts,omitempty"`
+	SkipCertVerify bool               `yaml:"skip-cert-verify,omitempty"`
+	Host           string             `yaml:"host,omitempty"`
+	Path           string             `yaml:"path,omitempty"`
+	Mux            bool               `yaml:"mux,omitempty"`
+}
+
+type ClashProxyWsOpts struct {
+	Path    string                   `yaml:"path,omitempty"`
+	Headers *ClashProxyWsOptsHeaders `yaml:"headers,omitempty"`
+}
+
+type ClashProxyWsOptsHeaders struct {
+	Host string `yaml:"Host,omitempty"`
+}
+
+type ClashProxyGrpcOpts struct {
+	GrpcServiceName string `yaml:"grpc-service-name,omitempty"`
+}
+
+func tryToParseClashYaml(text string) (*conf.Config, error) {
+	clashBytes := []byte(text)
+	clash := ClashYaml{}
+
+	err := yaml.Unmarshal(clashBytes, &clash)
+	if err != nil {
+		return nil, err
+	}
+
+	xray := clash.xrayConfig()
+	return xray, nil
+}
+
+func (clash ClashYaml) xrayConfig() *conf.Config {
+	xray := &conf.Config{}
+
+	var outbounds []conf.OutboundDetourConfig
+	for _, proxy := range clash.Proxies {
+		if outbound, err := proxy.outbound(); err == nil {
+			outbounds = append(outbounds, *outbound)
+		} else {
+			fmt.Println(err)
+		}
+	}
+	xray.OutboundConfigs = outbounds
+
+	return xray
+}
+
+func (proxy ClashProxy) outbound() (*conf.OutboundDetourConfig, error) {
+	switch proxy.Type {
+	case "ss":
+		outbound, err := proxy.shadowsocksOutbound()
+		if err != nil {
+			return nil, err
+		}
+		return outbound, nil
+
+	case "vmess":
+		outbound, err := proxy.vmessOutbound()
+		if err != nil {
+			return nil, err
+		}
+		return outbound, nil
+
+	case "vless":
+		outbound, err := proxy.vlessOutbound()
+		if err != nil {
+			return nil, err
+		}
+		return outbound, nil
+
+	case "socks5":
+		outbound, err := proxy.socksOutbound()
+		if err != nil {
+			return nil, err
+		}
+		return outbound, nil
+	case "trojan":
+		outbound, err := proxy.trojanOutbound()
+		if err != nil {
+			return nil, err
+		}
+		return outbound, nil
+	case "hysteria2":
+		outbound, err := proxy.hysteria2Outbound()
+		if err != nil {
+			return nil, err
+		}
+		return outbound, nil
+	}
+	return nil, fmt.Errorf("unsupport proxy type: %s", proxy.Type)
+}
+
+func (proxy ClashProxy) shadowsocksOutbound() (*conf.OutboundDetourConfig, error) {
+	outbound := &conf.OutboundDetourConfig{}
+	outbound.Protocol = "shadowsocks"
+	setOutboundName(outbound, proxy.Name)
+
+	settings := conf.ShadowsocksClientConfig{}
+
+	settings.Address = parseAddress(proxy.Server)
+	settings.Port = proxy.Port
+
+	settings.Cipher = proxy.Cipher
+	settings.Password = proxy.Password
+	settings.UoT = proxy.UdpOverTcp
+
+	settingsRawMessage, err := convertJsonToRawMessage(settings)
+	if err != nil {
+		return nil, err
+	}
+	outbound.Settings = &settingsRawMessage
+
+	if len(proxy.Plugin) != 0 {
+		if proxy.Plugin != "v2ray-plugin" {
+			return nil, fmt.Errorf("unsupport ss plugin: obfs")
+		}
+		if proxy.PluginOpts == nil {
+			return nil, fmt.Errorf("unsupport ss plugin-opts: nil")
+		}
+		if proxy.PluginOpts.Mode != "websocket" {
+			return nil, fmt.Errorf("unsupport ss plugin-opts mode: %s", proxy.PluginOpts.Mode)
+		}
+		streamSetting := &conf.StreamConfig{}
+		network := conf.TransportProtocol("websocket")
+		streamSetting.Network = &network
+
+		wsSettings := &conf.WebSocketConfig{}
+		if len(proxy.PluginOpts.Host) > 0 {
+			wsSettings.Host = proxy.PluginOpts.Host
+		}
+		if len(proxy.PluginOpts.Path) > 0 {
+			wsSettings.Path = proxy.PluginOpts.Path
+		}
+		streamSetting.WSSettings = wsSettings
+
+		if proxy.PluginOpts.Tls {
+			tlsSettings := &conf.TLSConfig{}
+			tlsSettings.Fingerprint = proxy.PluginOpts.Fingerprint
+
+			if proxy.PluginOpts.EchOpts != nil {
+				if proxy.PluginOpts.EchOpts.Enable {
+					tlsSettings.ECHConfigList = proxy.PluginOpts.EchOpts.Config
+				}
+			}
+
+			streamSetting.TLSSettings = tlsSettings
+		}
+
+		outbound.StreamSetting = streamSetting
+	}
+	return outbound, nil
+}
+
+func (proxy ClashProxy) vmessOutbound() (*conf.OutboundDetourConfig, error) {
+	outbound := &conf.OutboundDetourConfig{}
+	outbound.Protocol = "vmess"
+	setOutboundName(outbound, proxy.Name)
+
+	settings := conf.VMessOutboundConfig{}
+
+	settings.Address = parseAddress(proxy.Server)
+	settings.Port = proxy.Port
+
+	settings.ID = proxy.Uuid
+	settings.Security = proxy.Cipher
+
+	settingsRawMessage, err := convertJsonToRawMessage(settings)
+	if err != nil {
+		return nil, err
+	}
+	outbound.Settings = &settingsRawMessage
+
+	streamSettings, err := proxy.streamSettings(*outbound)
+	if err != nil {
+		return nil, err
+	}
+	outbound.StreamSetting = streamSettings
+
+	return outbound, nil
+}
+
+func (proxy ClashProxy) vlessOutbound() (*conf.OutboundDetourConfig, error) {
+	outbound := &conf.OutboundDetourConfig{}
+	outbound.Protocol = "vless"
+	setOutboundName(outbound, proxy.Name)
+
+	settings := conf.VLessOutboundConfig{}
+
+	settings.Address = parseAddress(proxy.Server)
+	settings.Port = proxy.Port
+
+	settings.Id = proxy.Uuid
+	settings.Flow = proxy.Flow
+	if len(proxy.Encryption) > 0 {
+		settings.Encryption = proxy.Encryption
+	}
+
+	settingsRawMessage, err := convertJsonToRawMessage(settings)
+	if err != nil {
+		return nil, err
+	}
+	outbound.Settings = &settingsRawMessage
+
+	streamSettings, err := proxy.streamSettings(*outbound)
+	if err != nil {
+		return nil, err
+	}
+	outbound.StreamSetting = streamSettings
+
+	return outbound, nil
+}
+
+func (proxy ClashProxy) socksOutbound() (*conf.OutboundDetourConfig, error) {
+	outbound := &conf.OutboundDetourConfig{}
+	outbound.Protocol = "socks"
+	setOutboundName(outbound, proxy.Name)
+
+	settings := conf.SocksClientConfig{}
+
+	settings.Address = parseAddress(proxy.Server)
+	settings.Port = proxy.Port
+
+	settings.Username = proxy.Username
+	settings.Password = proxy.Password
+
+	settingsRawMessage, err := convertJsonToRawMessage(settings)
+	if err != nil {
+		return nil, err
+	}
+	outbound.Settings = &settingsRawMessage
+
+	streamSettings, err := proxy.streamSettings(*outbound)
+	if err != nil {
+		return nil, err
+	}
+	outbound.StreamSetting = streamSettings
+
+	return outbound, nil
+}
+
+func (proxy ClashProxy) trojanOutbound() (*conf.OutboundDetourConfig, error) {
+	outbound := &conf.OutboundDetourConfig{}
+	outbound.Protocol = "trojan"
+	setOutboundName(outbound, proxy.Name)
+
+	settings := conf.TrojanClientConfig{}
+
+	settings.Address = parseAddress(proxy.Server)
+	settings.Port = proxy.Port
+
+	settings.Password = proxy.Password
+
+	settingsRawMessage, err := convertJsonToRawMessage(settings)
+	if err != nil {
+		return nil, err
+	}
+	outbound.Settings = &settingsRawMessage
+
+	streamSettings, err := proxy.streamSettings(*outbound)
+	if err != nil {
+		return nil, err
+	}
+	outbound.StreamSetting = streamSettings
+
+	return outbound, nil
+}
+
+func (proxy ClashProxy) hysteria2Outbound() (*conf.OutboundDetourConfig, error) {
+	outbound := &conf.OutboundDetourConfig{}
+	outbound.Protocol = "hysteria"
+	setOutboundName(outbound, proxy.Name)
+
+	settings := conf.HysteriaClientConfig{}
+
+	settings.Version = 2
+	settings.Address = parseAddress(proxy.Server)
+	settings.Port = proxy.Port
+
+	settingsRawMessage, err := convertJsonToRawMessage(settings)
+	if err != nil {
+		return nil, err
+	}
+	outbound.Settings = &settingsRawMessage
+
+	streamSettings, err := proxy.streamSettings(*outbound)
+	if err != nil {
+		return nil, err
+	}
+	outbound.StreamSetting = streamSettings
+
+	return outbound, nil
+}
+
+func (proxy ClashProxy) streamSettings(outbound conf.OutboundDetourConfig) (*conf.StreamConfig, error) {
+	streamSettings := &conf.StreamConfig{}
+	network := proxy.Network
+	if len(proxy.Network) == 0 {
+		network = "raw"
+	}
+	transportProtocol := conf.TransportProtocol(network)
+	streamSettings.Network = &transportProtocol
+
+	// fix hysteria network
+	if proxy.Type == "hysteria2" {
+		network = "hysteria"
+		transportProtocol = conf.TransportProtocol("hysteria")
+		streamSettings.Network = &transportProtocol
+	}
+
+	switch network {
+	case "ws":
+		if proxy.WsOpts != nil {
+			wsSettings := &conf.WebSocketConfig{}
+			if proxy.WsOpts.Headers != nil {
+				wsSettings.Host = proxy.WsOpts.Headers.Host
+			}
+			wsSettings.Path = proxy.WsOpts.Path
+			streamSettings.WSSettings = wsSettings
+		}
+	case "grpc":
+		if proxy.GrpcOpts != nil {
+			grpcSettings := &conf.GRPCConfig{}
+			grpcSettings.ServiceName = proxy.GrpcOpts.GrpcServiceName
+			streamSettings.GRPCSettings = grpcSettings
+		}
+	case "hysteria":
+		hysteriaSettings := &conf.HysteriaConfig{}
+		hysteriaSettings.Version = 2
+		hysteriaSettings.Auth = proxy.Password
+		if len(proxy.Up) > 0 {
+			hysteriaSettings.Up = conf.Bandwidth(proxy.Up)
+		}
+		if len(proxy.Down) > 0 {
+			hysteriaSettings.Down = conf.Bandwidth(proxy.Down)
+		}
+		if len(proxy.Ports) > 0 {
+			udpHop := conf.UdpHop{}
+			portListRawMessage, err := convertJsonToRawMessage(proxy.Ports)
+			if err != nil {
+				return nil, err
+			}
+			udpHop.PortList = portListRawMessage
+
+			interval := conf.Int32Range{}
+			interval.Left = proxy.HopInterval
+			interval.Right = proxy.HopInterval
+
+			udpHop.Interval = &interval
+
+			hysteriaSettings.UdpHop = udpHop
+		}
+		streamSettings.HysteriaSettings = hysteriaSettings
+		// udpmasks
+		if proxy.Obfs == "salamander" {
+			obfs := conf.Mask{}
+			obfs.Type = "salamander"
+
+			settings := &conf.Salamander{}
+			settings.Password = proxy.ObfsPassword
+
+			settingsRawMessage, err := convertJsonToRawMessage(settings)
+			if err != nil {
+				return nil, err
+			}
+
+			obfs.Settings = &settingsRawMessage
+
+			udp := []conf.Mask{obfs}
+			finalMask := conf.FinalMask{}
+			finalMask.Udp = udp
+
+			streamSettings.FinalMask = &finalMask
+		}
+	}
+	proxy.parseSecurity(streamSettings, outbound)
+	return streamSettings, nil
+}
+
+func (proxy ClashProxy) parseSecurity(streamSettings *conf.StreamConfig, outbound conf.OutboundDetourConfig) {
+	tlsSettings := &conf.TLSConfig{}
+	realitySettings := &conf.REALITYConfig{}
+
+	if proxy.Tls {
+		streamSettings.Security = "tls"
+	}
+
+	if proxy.EchOpts != nil {
+		if proxy.EchOpts.Enable {
+			tlsSettings.ECHConfigList = proxy.EchOpts.Config
+		}
+	}
+
+	if proxy.RealityOpts != nil {
+		streamSettings.Security = "reality"
+		realitySettings.PublicKey = proxy.RealityOpts.PublicKey
+		realitySettings.ShortId = proxy.RealityOpts.ShortId
+	}
+	if len(proxy.Servername) > 0 {
+		tlsSettings.ServerName = proxy.Servername
+		realitySettings.ServerName = proxy.Servername
+	}
+	if len(proxy.Sni) > 0 {
+		tlsSettings.ServerName = proxy.Sni
+		realitySettings.ServerName = proxy.Sni
+	}
+	if len(proxy.Alpn) > 0 {
+		alpn := conf.StringList(proxy.Alpn)
+		tlsSettings.ALPN = &alpn
+	}
+	if len(proxy.Fingerprint) > 0 {
+		tlsSettings.Fingerprint = proxy.Fingerprint
+		realitySettings.Fingerprint = proxy.Fingerprint
+	}
+	if len(proxy.ClientFingerprint) > 0 {
+		tlsSettings.Fingerprint = proxy.ClientFingerprint
+		realitySettings.Fingerprint = proxy.ClientFingerprint
+	}
+
+	if outbound.Protocol == "trojan" && len(streamSettings.Security) == 0 {
+		streamSettings.Security = "tls"
+	}
+
+	switch streamSettings.Security {
+	case "tls":
+		streamSettings.TLSSettings = tlsSettings
+	case "reality":
+		streamSettings.REALITYSettings = realitySettings
+	}
+}

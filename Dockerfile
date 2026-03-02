@@ -3,12 +3,10 @@ FROM golang:1.25.7 AS build
 WORKDIR /proxy-thing
 
 COPY go.mod go.sum ./
+
 RUN go mod download
 
 COPY . .
-
-# openssl genrsa -out proxy-thing.key 2048
-# openssl req -new -x509 -days 3650 -key proxy-thing.key -out proxy-thing.crt -subj "/CN=Proxy-Thing"
 
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /bin/proxy-thing main.go
 

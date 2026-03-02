@@ -1,29 +1,26 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
+	"io"
 	"log"
+	"math/rand/v2"
 	"net/http"
-	"net/url"
 	"os"
-	"regexp"
 	"strings"
+	"time"
 
+	"dokinar.ik/proxy-thing/internal"
 	"github.com/elazarl/goproxy"
-	"github.com/icza/backscanner"
-	"github.com/xtls/xray-core/app/proxyman/command"
 	"github.com/xtls/xray-core/common/net"
-	"github.com/xtls/xray-core/common/protocol"
-	"github.com/xtls/xray-core/common/serial"
+	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/common/uuid"
 	"github.com/xtls/xray-core/core"
-	"github.com/xtls/xray-core/proxy/vless"
-	"github.com/xtls/xray-core/proxy/vless/outbound"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
+	_ "github.com/xtls/xray-core/transport/internet/tcp"
 )
 
 func main() {
@@ -45,62 +42,173 @@ func main() {
 	}
 	goproxy.GoproxyCa = goproxyCa
 
-	xrayURL := "http://xray:1080"
-	upstream, _ := url.Parse(xrayURL)
+	engine, err := internal.NewXrayEngine()
+	if err != nil {
+		log.Fatalf("xray engine init: %v", err)
+	}
+	defer engine.Instance.Close()
+
+	proxies, _ := os.ReadFile("/etc/proxy-thing/proxies.txt")
+
+	engine.AddOutbounds(string(proxies))
 
 	proxy := goproxy.NewProxyHttpServer()
-	proxy.Verbose = true
+	proxy.Verbose = false
 
 	proxy.Tr = &http.Transport{
-		Proxy:             http.ProxyURL(upstream),
-		TLSClientConfig:   &tls.Config{InsecureSkipVerify: true},
-		DisableKeepAlives: true,
+		TLSHandshakeTimeout:   time.Second * 15,
+		ResponseHeaderTimeout: time.Second * 15,
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			dest, err := internal.BuildDestination(network, addr)
+			if err != nil {
+				return nil, err
+			}
+
+			tag := pickOutboundTag(addr, engine)
+			ctx = session.SetForcedOutboundTagToContext(ctx, tag)
+			conn, err := core.Dial(ctx, engine.Instance, dest)
+			if err != nil {
+				log.Printf("xray dial error: %v", err)
+				return nil, err
+			}
+			return conn, nil
+		},
+		IdleConnTimeout: 1 * time.Second,
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 	}
+	proxy.ConnectDial = func(network, addr string) (net.Conn, error) {
+		dest, err := internal.BuildDestination(network, addr)
+		if err != nil {
+			return nil, err
+		}
+		ctx := context.Background()
+		tag := pickOutboundTag(addr, engine)
+		ctx = session.SetForcedOutboundTagToContext(ctx, tag)
 
-	proxy.ConnectDial = proxy.NewConnectDialToProxy(xrayURL)
-
-	proxy.OnRequest().HandleConnect(goproxy.AlwaysMitm)
-
-	xrayLog, err := os.Open("/var/log/xray/access.log")
-
-	if err != nil {
-		log.Fatal(err)
+		return core.Dial(ctx, engine.Instance, dest)
 	}
-
-	defer xrayLog.Close()
+	proxy.OnRequest().HandleConnect(goproxy.FuncHttpsHandler(func(host string, ctx *goproxy.ProxyCtx) (*goproxy.ConnectAction, string) {
+		if strings.HasSuffix(host, ":443") {
+			return goproxy.MitmConnect, host
+		}
+		return goproxy.OkConnect, host
+	}))
 
 	proxy.OnRequest().DoFunc(func(req *http.Request, ctx *goproxy.ProxyCtx) (*http.Request, *http.Response) {
-		q := req.URL.Query()
-		q.Set("ysclid", fmt.Sprintf("%s-%s", uuid.New(), uuid.New()))
-		req.URL.RawQuery = q.Encode()
+		if strings.Contains(ctx.Req.Host, "telegram") {
+			return req, nil
+		}
 
+		q := req.URL.Query()
+		q.Add("ysclid", fmt.Sprintf("%s-%s", uuid.New(), uuid.New()))
+		req.URL.RawQuery = q.Encode()
 		return req, nil
 	})
 
-	MAX_RETRIES := 5
+	proxy.OnRequest().DoFunc(func(req *http.Request, ctx *goproxy.ProxyCtx) (*http.Request, *http.Response) {
+		if req.Body != nil && req.Body != http.NoBody {
+			bodyBytes, _ := io.ReadAll(req.Body)
+			req.Body.Close()
+
+			req.GetBody = func() (io.ReadCloser, error) {
+				return io.NopCloser(bytes.NewReader(bodyBytes)), nil
+			}
+			req.Body, _ = req.GetBody()
+		}
+		return req, nil
+	})
+
+	const MAX_RETRIES = 5
+	const MAX_REDIRECTS = 10
+	const MAX_RESPONSE_RETRIES = 5
+
+	proxy.OnRequest().DoFunc(func(req *http.Request, ctx *goproxy.ProxyCtx) (*http.Request, *http.Response) {
+		if strings.Contains(req.Host, "telegram") {
+			return req, nil
+		}
+		current := req
+
+		for redirects := 0; redirects < MAX_REDIRECTS; redirects++ {
+			var (
+				resp *http.Response
+				err  error
+			)
+
+			for tries := 0; tries <= MAX_RETRIES; tries++ {
+				if tries > 0 && current.GetBody != nil {
+					current.Body, _ = current.GetBody()
+				}
+				resp, err = proxy.Tr.RoundTrip(current)
+				if err == nil {
+					break
+				}
+				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+					log.Printf("Network timeout (attempt %d/%d) for %s: %v", tries+1, MAX_RETRIES, current.URL, err)
+					continue
+				}
+				return current, goproxy.NewResponse(current, goproxy.ContentTypeText, 502, "Bad Gateway: "+err.Error())
+			}
+
+			if resp == nil {
+				return current, goproxy.NewResponse(current, goproxy.ContentTypeText, 504, "Gateway Timeout: "+err.Error())
+			}
+
+			if resp.StatusCode >= 300 && resp.StatusCode <= 308 && resp.StatusCode != 304 {
+				loc, err := resp.Location()
+				if err != nil {
+					return current, resp
+				}
+
+				current.URL = loc
+				current.Host = loc.Host
+
+				switch resp.StatusCode {
+				case 301, 302, 303:
+					current.Method = http.MethodGet
+					current.Body, current.GetBody = nil, nil
+					current.ContentLength = 0
+					current.Header.Del("Content-Type")
+					current.Header.Del("Content-Length")
+				case 307, 308:
+					if current.GetBody != nil {
+						current.Body, _ = current.GetBody()
+					}
+				}
+
+				resp.Body.Close()
+				continue
+			}
+
+			return current, resp
+		}
+
+		return current, goproxy.NewResponse(current, goproxy.ContentTypeText, 508, "Loop Detected: Too many redirects")
+	})
 	proxy.OnResponse().DoFunc(func(resp *http.Response, ctx *goproxy.ProxyCtx) *http.Response {
 		if resp == nil {
 			return resp
 		}
 
+		resp.Close = true
+		resp.Header.Set("Connection", "close")
+		q := ctx.Req.URL.Query()
+		q.Del("ysclid")
+		ctx.Req.URL.RawQuery = q.Encode()
 		attempt := 1
-		client := &http.Client{Transport: proxy.Tr}
-
-		for resp.StatusCode >= 400 && attempt <= MAX_RETRIES {
+		for resp.StatusCode >= 400 && attempt <= MAX_RESPONSE_RETRIES {
 			newReq := ctx.Req.Clone(ctx.Req.Context())
-			newReq.Header.Set("Connection", "close")
-			newResp, err := client.Do(newReq)
-			if err != nil {
-				break
-			}
-			tag, err := findProxy(xrayLog, ctx.Req.URL.String())
 
-			if err != nil {
-				break
+			if newReq.GetBody != nil {
+				newReq.Body, _ = newReq.GetBody()
 			}
 
-			log.Printf("[%s] %s -> %d retry %d", tag, ctx.Req.URL.String(), resp.StatusCode, attempt)
+			newResp, err := proxy.Tr.RoundTrip(newReq)
+			if err != nil {
+				log.Printf("OnResponse retry %d failed: %v", attempt, err)
+				break
+			}
 
+			log.Printf("Retry %d: %s -> %d", attempt, ctx.Req.URL.String(), newResp.StatusCode)
 			resp = newResp
 			attempt++
 		}
@@ -109,78 +217,15 @@ func main() {
 	})
 
 	addr := ":1337"
-	log.Printf("%s", addr)
+	log.Printf("Listening on %s", addr)
 	log.Fatal(http.ListenAndServe(addr, proxy))
 }
 
-func findProxy(xrayLog *os.File, urlStr string) (string, error) {
-	xStat, err := xrayLog.Stat()
-
-	if err != nil {
-		return "", err
+func pickOutboundTag(_ string, engine *internal.XrayEngine) string {
+	if len(engine.Tags) > 0 {
+		min := 0
+		max := len(engine.Tags) - 1
+		return engine.Tags[rand.IntN(max-min+1)+min]
 	}
-
-	reTag := regexp.MustCompile(`\[http-in >>|\-> (.*)\]`)
-	xSize := xStat.Size()
-	scanner := backscanner.New(xrayLog, int(xSize))
-	for {
-		line, _, err := scanner.LineBytes()
-		if err != nil {
-			return "", err
-		}
-		strLine := string(line)
-
-		if strings.Contains(strLine, urlStr) {
-			tagMatch := reTag.FindStringSubmatch(strLine)
-
-			if len(tagMatch) > 1 {
-				return tagMatch[1], nil
-			}
-		}
-	}
-}
-
-func addNew() error {
-	conn, err := grpc.NewClient("xray:8080", grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		log.Fatalf("Failed to connect: %v", err)
-		return err
-	}
-	defer conn.Close()
-
-	client := command.NewHandlerServiceClient(conn)
-
-	out := &outbound.Config{
-		Vnext: &protocol.ServerEndpoint{
-			Address: &net.IPOrDomain{
-				Address: &net.IPOrDomain_Domain{
-					Domain: "domain.com",
-				},
-			},
-			Port: 443,
-			User: &protocol.User{
-				Account: serial.ToTypedMessage(&vless.Account{
-					Id:         "random-uuid",
-					Flow:       "xtls-rprx-vision",
-					Encryption: "none",
-				}),
-			},
-		},
-	}
-	request := &command.AddOutboundRequest{
-		Outbound: &core.OutboundHandlerConfig{
-			Tag:           "test-vless",
-			ProxySettings: serial.ToTypedMessage(out),
-		},
-	}
-
-	r, err := client.AddOutbound(context.Background(), request)
-
-	if err != nil {
-		log.Printf("ERROR Sent: %+v\n", err)
-		return err
-	}
-	log.Printf("Sent: %+v\n", r)
-
-	return nil
+	return "proxy-1"
 }
