@@ -29,24 +29,30 @@ type Host struct {
 	Address  string
 	BannedAt int64
 }
+
 type OutboundInfo struct {
 	Tag      string
 	BadHosts []Host
 	Ping     time.Duration
 }
 
+type XrayLimits struct {
+	HostBanTime    time.Duration
+	GCIntervalTime time.Duration
+}
+
 type XrayEngine struct {
-	Instance  *core.Instance
+	Instance *core.Instance
+
+	Limits    XrayLimits
 	Scheduler gocron.Scheduler
+
 	Outbounds []OutboundInfo
 }
 
-const (
-	HOST_BAN_MAX_TIME = 5 * time.Minute
-	PING_MAX_TIME     = 1 * time.Hour
-)
+const PING_MAX_TIME = 1 * time.Hour
 
-func NewXrayEngine() (*XrayEngine, error) {
+func NewXrayEngine(limits XrayLimits) (*XrayEngine, error) {
 	cfg := &core.Config{
 		App: []*serial.TypedMessage{
 			serial.ToTypedMessage(&proxyman.OutboundConfig{}),
@@ -62,11 +68,8 @@ func NewXrayEngine() (*XrayEngine, error) {
 	}
 
 	inst, err := core.New(cfg)
-	if err != nil {
-		return nil, err
-	}
 
-	if err := inst.Start(); err != nil {
+	if err != nil {
 		return nil, err
 	}
 
@@ -79,10 +82,11 @@ func NewXrayEngine() (*XrayEngine, error) {
 	engine := &XrayEngine{
 		Instance:  inst,
 		Scheduler: scheduler,
+		Limits:    limits,
 	}
 
 	_, err = scheduler.NewJob(
-		gocron.DurationJob(2*time.Second),
+		gocron.DurationJob(time.Duration(engine.Limits.GCIntervalTime)),
 		gocron.NewTask(engine.GarbageWorker),
 	)
 
@@ -90,8 +94,17 @@ func NewXrayEngine() (*XrayEngine, error) {
 		return nil, err
 	}
 
-	scheduler.Start()
 	return engine, nil
+}
+
+func (e *XrayEngine) Start() error {
+	if err := e.Instance.Start(); err != nil {
+		return err
+	}
+
+	e.Scheduler.Start()
+
+	return nil
 }
 
 func BuildDestination(network, addr string) (net.Destination, error) {
@@ -103,6 +116,7 @@ func BuildDestination(network, addr string) (net.Destination, error) {
 }
 
 func (e *XrayEngine) Close() {
+	log.Println("[xray] bye-bye")
 	e.Instance.Close()
 	e.Scheduler.Shutdown()
 }
@@ -114,7 +128,7 @@ func (e *XrayEngine) GarbageWorker() {
 
 	for i, outbound := range e.Outbounds {
 		for j, host := range e.Outbounds[i].BadHosts {
-			if time.Since(time.Unix(host.BannedAt, 0)) > HOST_BAN_MAX_TIME {
+			if time.Since(time.Unix(host.BannedAt, 0)) > time.Duration(e.Limits.HostBanTime) {
 				log.Printf("GarbageWorker: Unbanning %s for %s\n", host.Address, outbound.Tag)
 
 				e.Outbounds[i].BadHosts = slices.Delete(e.Outbounds[i].BadHosts, j, j+1)

@@ -20,27 +20,34 @@ import (
 	"github.com/xtls/xray-core/core"
 )
 
-const MAX_TIMEOUT_RETRIES = 5
-const MAX_RESPONSE_RETRIES = 2
-const MAX_REDIRECTS = 3
+type ProxyLimits struct {
+	MaxTimeoutRetries  int
+	MaxResponseRetries int
+	MaxRedirects       int
+}
 
 type Proxy struct {
 	*goproxy.ProxyHttpServer
 
 	Engine *xray.XrayEngine
 
+	Limits ProxyLimits
+
 	OnFinish func(failedTags []string, tag string, resp *http.Response)
 }
 
 func NewProxy(engine *xray.XrayEngine) *Proxy {
-	initCerts()
-
 	gproxy := goproxy.NewProxyHttpServer()
 	gproxy.Verbose = false
 
 	proxy := &Proxy{
 		ProxyHttpServer: gproxy,
 		Engine:          engine,
+		Limits: ProxyLimits{
+			MaxTimeoutRetries:  5,
+			MaxResponseRetries: 5,
+			MaxRedirects:       3,
+		},
 	}
 
 	gproxy.OnRequest().HandleConnect(goproxy.FuncHttpsHandler(proxy.handleConnect))
@@ -93,11 +100,11 @@ func (proxy *Proxy) OnRequestFunc(req *http.Request, ctx *goproxy.ProxyCtx) (*ht
 		}
 
 		currentReq := originalReq
-		for redirects := 0; redirects <= MAX_REDIRECTS; redirects++ {
+		for redirects := 0; redirects <= proxy.Limits.MaxRedirects; redirects++ {
 			var resp *http.Response
 			var err error
 
-			for tries := 0; tries <= MAX_TIMEOUT_RETRIES; tries++ {
+			for tries := 0; tries <= proxy.Limits.MaxTimeoutRetries; tries++ {
 				attemptReq := currentReq.Clone(currentReq.Context())
 				if attemptReq.GetBody != nil {
 					attemptReq.Body, _ = attemptReq.GetBody()
@@ -107,7 +114,7 @@ func (proxy *Proxy) OnRequestFunc(req *http.Request, ctx *goproxy.ProxyCtx) (*ht
 				if err == nil {
 					break
 				}
-				if netErr, ok := err.(net.Error); ok && netErr.Timeout() && tries < MAX_TIMEOUT_RETRIES {
+				if netErr, ok := err.(net.Error); ok && netErr.Timeout() && tries < proxy.Limits.MaxTimeoutRetries {
 					continue
 				}
 				return nil, err
@@ -147,7 +154,7 @@ func (proxy *Proxy) OnResponseFunc(resp *http.Response, ctx *goproxy.ProxyCtx) *
 	}
 
 	attempt := 1
-	for resp.StatusCode == 403 && attempt <= MAX_RESPONSE_RETRIES {
+	for resp.StatusCode == 403 && attempt <= proxy.Limits.MaxResponseRetries {
 		resp.Body.Close()
 		newReq := ctx.Req.Clone(ctx.Req.Context())
 		if newReq.GetBody != nil {
@@ -189,12 +196,12 @@ func (proxy *Proxy) OnResponseFunc(resp *http.Response, ctx *goproxy.ProxyCtx) *
 	return resp
 }
 
-func initCerts() {
-	caCert, err := os.ReadFile("/etc/proxy-thing/ca.crt")
+func InitCerts(crtPath string, keyPath string) {
+	caCert, err := os.ReadFile(crtPath)
 	if err != nil {
 		log.Fatalf("ca.crt: %v", err)
 	}
-	caKey, err := os.ReadFile("/etc/proxy-thing/ca.key")
+	caKey, err := os.ReadFile(keyPath)
 	if err != nil {
 		log.Fatalf("ca.key: %v", err)
 	}
