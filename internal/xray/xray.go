@@ -1,4 +1,4 @@
-package internal
+package xray
 
 import (
 	"context"
@@ -17,6 +17,7 @@ import (
 	"github.com/xtls/xray-core/common/serial"
 	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/core"
+	// _ "github.com/xtls/xray-core/transport/internet/tcp"
 )
 
 type XrayEngine struct {
