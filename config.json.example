@@ -1,0 +1,15 @@
+{
+	"address": "127.0.0.1:1337",
+	"limits": {
+		"banTime": 60,
+		"gcIntervalTime": 60,
+		"maxTimeoutRetries": 5,
+		"maxResponseRetries": 5,
+		"maxRedirects": 3
+	},
+	"paths": {
+		"crt": "proxy-thing.crt",
+		"key": "proxy-thing.key",
+		"proxies": "proxies.txt"
+	}
+}
