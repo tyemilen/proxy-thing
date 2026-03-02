@@ -69,9 +69,9 @@ func (proxy *Proxy) OnRequestFunc(req *http.Request, ctx *goproxy.ProxyCtx) (*ht
 
 	ctx.RoundTripper = goproxy.RoundTripperFunc(func(originalReq *http.Request, ctx *goproxy.ProxyCtx) (*http.Response, error) {
 		tr := &http.Transport{
-			TLSHandshakeTimeout:   5 * time.Second,
-			ResponseHeaderTimeout: 5 * time.Second,
-			IdleConnTimeout:       5 * time.Second,
+			TLSHandshakeTimeout:   15 * time.Second,
+			ResponseHeaderTimeout: 15 * time.Second,
+			IdleConnTimeout:       15 * time.Second,
 			TLSClientConfig:       &tls.Config{InsecureSkipVerify: true},
 			DisableKeepAlives:     true,
 			DialContext: func(dialCtx context.Context, network, addr string) (net.Conn, error) {
