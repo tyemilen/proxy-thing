@@ -30,11 +30,9 @@ type Proxy struct {
 	Engine *xray.XrayEngine
 
 	OnFinish func(failedTags []string, tag string, resp *http.Response)
-
-	GetTag func(a string, e *xray.XrayEngine) string
 }
 
-func NewProxy(engine *xray.XrayEngine, getTag func(a string, e *xray.XrayEngine) string) *Proxy {
+func NewProxy(engine *xray.XrayEngine) *Proxy {
 	initCerts()
 
 	gproxy := goproxy.NewProxyHttpServer()
@@ -43,7 +41,6 @@ func NewProxy(engine *xray.XrayEngine, getTag func(a string, e *xray.XrayEngine)
 	proxy := &Proxy{
 		ProxyHttpServer: gproxy,
 		Engine:          engine,
-		GetTag:          getTag,
 	}
 
 	gproxy.OnRequest().HandleConnect(goproxy.FuncHttpsHandler(proxy.handleConnect))
@@ -72,9 +69,9 @@ func (proxy *Proxy) OnRequestFunc(req *http.Request, ctx *goproxy.ProxyCtx) (*ht
 
 	ctx.RoundTripper = goproxy.RoundTripperFunc(func(originalReq *http.Request, ctx *goproxy.ProxyCtx) (*http.Response, error) {
 		tr := &http.Transport{
-			TLSHandshakeTimeout:   15 * time.Second,
-			ResponseHeaderTimeout: 15 * time.Second,
-			IdleConnTimeout:       15 * time.Second,
+			TLSHandshakeTimeout:   5 * time.Second,
+			ResponseHeaderTimeout: 5 * time.Second,
+			IdleConnTimeout:       5 * time.Second,
 			TLSClientConfig:       &tls.Config{InsecureSkipVerify: true},
 			DisableKeepAlives:     true,
 			DialContext: func(dialCtx context.Context, network, addr string) (net.Conn, error) {
@@ -83,9 +80,11 @@ func (proxy *Proxy) OnRequestFunc(req *http.Request, ctx *goproxy.ProxyCtx) (*ht
 					return nil, err
 				}
 
-				tag := proxy.GetTag(addr, proxy.Engine)
-
+				var tag string
 				tags, _ := ctx.UserData.([]string)
+
+				tag = proxy.Engine.PickOutboundTag(addr, tags)
+
 				ctx.UserData = append(tags, tag)
 
 				dialCtx = session.SetForcedOutboundTagToContext(dialCtx, tag)
@@ -148,7 +147,7 @@ func (proxy *Proxy) OnResponseFunc(resp *http.Response, ctx *goproxy.ProxyCtx) *
 	}
 
 	attempt := 1
-	for resp.StatusCode >= 400 && attempt <= MAX_RESPONSE_RETRIES {
+	for resp.StatusCode == 403 && attempt <= MAX_RESPONSE_RETRIES {
 		resp.Body.Close()
 		newReq := ctx.Req.Clone(ctx.Req.Context())
 		if newReq.GetBody != nil {
@@ -156,7 +155,10 @@ func (proxy *Proxy) OnResponseFunc(resp *http.Response, ctx *goproxy.ProxyCtx) *
 		}
 
 		newResp, err := ctx.RoundTrip(newReq)
-		log.Println("retry ...")
+
+		allTags, _ := ctx.UserData.([]string)
+		log.Printf("Retrying [%s] -> %s\n", allTags[len(allTags)-1], newReq.Host)
+
 		if err != nil {
 			log.Printf("Tag failed due to network error: %v", err)
 			break

@@ -2,7 +2,6 @@ package main
 
 import (
 	"log"
-	"math/rand/v2"
 	"net/http"
 	"os"
 
@@ -15,28 +14,29 @@ func main() {
 	if err != nil {
 		log.Fatalf("xray engine init: %v", err)
 	}
-	defer engine.Instance.Close()
+	defer engine.Close()
 
 	proxies, _ := os.ReadFile("/etc/proxy-thing/proxies.txt")
 
 	engine.AddOutbounds(string(proxies))
 
-	proxy := internal.NewProxy(engine, pickOutboundTag)
-	proxy.OnFinish = func(failed []string, tag string, res *http.Response) {
-		log.Printf("finished request for %s %s %d, fails: %+v\n", tag, res.Request.URL.String(), res.StatusCode, failed)
+	proxy := internal.NewProxy(engine)
+	proxy.OnFinish = func(failed []string, gtag string, res *http.Response) {
+		successTag := gtag
+
+		if successTag == "" {
+			successTag = "NONE"
+		}
+
+		log.Printf("finished request for %s %s %d, fails: %+v\n", successTag, res.Request.URL.Host, res.StatusCode, failed)
+
+		for _, tag := range failed {
+
+			proxy.Engine.BanHostFor(tag, res.Request.URL.Host)
+		}
 	}
 
 	addr := ":1337"
 	log.Printf("Listening on %s", addr)
 	log.Fatal(http.ListenAndServe(addr, proxy))
-}
-
-func pickOutboundTag(address string, engine *xray.XrayEngine) string {
-	log.Println(address)
-	if len(engine.Tags) > 0 {
-		min := 0
-		max := len(engine.Tags) - 1
-		return engine.Tags[rand.IntN(max-min+1)+min]
-	}
-	return "proxy-1"
 }
