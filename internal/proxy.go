@@ -76,11 +76,10 @@ func (proxy *Proxy) OnRequestFunc(req *http.Request, ctx *goproxy.ProxyCtx) (*ht
 
 	ctx.RoundTripper = goproxy.RoundTripperFunc(func(originalReq *http.Request, ctx *goproxy.ProxyCtx) (*http.Response, error) {
 		tr := &http.Transport{
-			TLSHandshakeTimeout:   15 * time.Second,
-			ResponseHeaderTimeout: 15 * time.Second,
-			IdleConnTimeout:       15 * time.Second,
+			TLSHandshakeTimeout:   25 * time.Second,
+			ResponseHeaderTimeout: 25 * time.Second,
+			IdleConnTimeout:       25 * time.Second,
 			TLSClientConfig:       &tls.Config{InsecureSkipVerify: true},
-			DisableKeepAlives:     true,
 			DialContext: func(dialCtx context.Context, network, addr string) (net.Conn, error) {
 				dest, err := xray.BuildDestination(network, addr)
 				if err != nil {
@@ -154,7 +153,7 @@ func (proxy *Proxy) OnResponseFunc(resp *http.Response, ctx *goproxy.ProxyCtx) *
 	}
 
 	attempt := 1
-	for resp.StatusCode == 403 && attempt <= proxy.Limits.MaxResponseRetries {
+	for (resp.StatusCode == 403 || resp.StatusCode == 429) && attempt <= proxy.Limits.MaxResponseRetries {
 		resp.Body.Close()
 		newReq := ctx.Req.Clone(ctx.Req.Context())
 		if newReq.GetBody != nil {

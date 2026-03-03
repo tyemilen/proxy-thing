@@ -81,7 +81,6 @@ func main() {
 		log.Printf("finished request for %s %s %d, fails: %+v\n", successTag, res.Request.URL.Host, res.StatusCode, failed)
 
 		for _, tag := range failed {
-
 			proxy.Engine.BanHostFor(tag, res.Request.URL.Host)
 		}
 	}
