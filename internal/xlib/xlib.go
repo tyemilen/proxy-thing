@@ -44,7 +44,7 @@ func ConvertShareLinksToXrayJson(links string) (*conf.Config, error) {
 	}
 }
 
-func decodeBase64Text(text string) (string, error) {
+func DecodeBase64Text(text string) (string, error) {
 	content, err := base64.StdEncoding.DecodeString(text)
 	if err == nil {
 		return string(content), nil
@@ -112,7 +112,7 @@ func parsePlainShareText(text string) (*conf.Config, error) {
 }
 
 func tryParse(text string) (*conf.Config, error) {
-	base64Text, err := decodeBase64Text(text)
+	base64Text, err := DecodeBase64Text(text)
 	if err == nil {
 		cleanText := fixWindowsReturn(base64Text)
 		return parsePlainShareText(cleanText)
@@ -185,7 +185,7 @@ func (proxy xrayShareLink) shadowsocksOutbound() (*conf.OutboundDetourConfig, er
 	settings.Port = uint16(port)
 
 	user := proxy.link.User.String()
-	passwordText, err := decodeBase64Text(user)
+	passwordText, err := DecodeBase64Text(user)
 	if err != nil {
 		return nil, err
 	}
@@ -214,7 +214,7 @@ func (proxy xrayShareLink) shadowsocksOutbound() (*conf.OutboundDetourConfig, er
 func (proxy xrayShareLink) vmessOutbound() (*conf.OutboundDetourConfig, error) {
 	// try vmessQrCode
 	text := strings.ReplaceAll(proxy.rawText, "vmess://", "")
-	base64Text, err := decodeBase64Text(text)
+	base64Text, err := DecodeBase64Text(text)
 	if err == nil {
 		return parseVMessQrCode(base64Text)
 	}
@@ -321,7 +321,7 @@ func (proxy xrayShareLink) socksOutbound() (*conf.OutboundDetourConfig, error) {
 
 	userPassword := proxy.link.User.String()
 	if len(userPassword) > 0 {
-		passwordText, err := decodeBase64Text(userPassword)
+		passwordText, err := DecodeBase64Text(userPassword)
 		if err != nil {
 			return nil, err
 		}

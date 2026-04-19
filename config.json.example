@@ -1,8 +1,12 @@
 {
 	"address": "127.0.0.1:1337",
+	"rules": {
+		"retryOn": [403, 406, 429]
+	},
 	"limits": {
 		"banTime": 60,
 		"gcIntervalTime": 60,
+		"pingIntervalTime": 21,
 		"maxTimeoutRetries": 5,
 		"maxResponseRetries": 5,
 		"maxRedirects": 3

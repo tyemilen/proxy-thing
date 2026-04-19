@@ -36,15 +36,16 @@ type OutboundInfo struct {
 	Ping     time.Duration
 }
 
-type XrayLimits struct {
-	HostBanTime    time.Duration
-	GCIntervalTime time.Duration
+type XrayEngineConfig struct {
+	HostBanTime      time.Duration
+	GCIntervalTime   time.Duration
+	PingIntervalTime time.Duration
 }
 
 type XrayEngine struct {
 	Instance *core.Instance
 
-	Limits    XrayLimits
+	Config    XrayEngineConfig
 	Scheduler gocron.Scheduler
 
 	Outbounds []OutboundInfo
@@ -52,7 +53,7 @@ type XrayEngine struct {
 
 const PING_MAX_TIME = 1 * time.Hour
 
-func NewXrayEngine(limits XrayLimits) (*XrayEngine, error) {
+func NewXrayEngine(config XrayEngineConfig) (*XrayEngine, error) {
 	cfg := &core.Config{
 		App: []*serial.TypedMessage{
 			serial.ToTypedMessage(&proxyman.OutboundConfig{}),
@@ -82,12 +83,21 @@ func NewXrayEngine(limits XrayLimits) (*XrayEngine, error) {
 	engine := &XrayEngine{
 		Instance:  inst,
 		Scheduler: scheduler,
-		Limits:    limits,
+		Config:    config,
 	}
 
 	_, err = scheduler.NewJob(
-		gocron.DurationJob(time.Duration(engine.Limits.GCIntervalTime)),
+		gocron.DurationJob(time.Duration(engine.Config.GCIntervalTime)),
 		gocron.NewTask(engine.GarbageWorker),
+	)
+
+	if err != nil {
+		return nil, err
+	}
+
+	_, err = scheduler.NewJob(
+		gocron.DurationJob(time.Duration(engine.Config.PingIntervalTime)),
+		gocron.NewTask(engine.PingWorker),
 	)
 
 	if err != nil {
@@ -98,11 +108,13 @@ func NewXrayEngine(limits XrayLimits) (*XrayEngine, error) {
 }
 
 func (e *XrayEngine) Start() error {
+	log.Printf("Scheduler starting. Job count: %d", len(e.Scheduler.Jobs()))
+
+	go e.Scheduler.Start()
+
 	if err := e.Instance.Start(); err != nil {
 		return err
 	}
-
-	e.Scheduler.Start()
 
 	return nil
 }
@@ -122,19 +134,22 @@ func (e *XrayEngine) Close() {
 }
 
 func (e *XrayEngine) GarbageWorker() {
-	// todo detect dead outbounds
-	// outboundManager := e.Instance.GetFeature(outbound.ManagerType()).(outbound.Manager)
-	// outboundManager.RemoveHandler(context.Background(), )
-
-	for i, outbound := range e.Outbounds {
-		for j, host := range e.Outbounds[i].BadHosts {
-			if time.Since(time.Unix(host.BannedAt, 0)) > time.Duration(e.Limits.HostBanTime) {
-				log.Printf("GarbageWorker: Unbanning %s for %s\n", host.Address, outbound.Tag)
+	for i := range e.Outbounds {
+		badHosts := e.Outbounds[i].BadHosts
+		for j := len(badHosts) - 1; j >= 0; j-- {
+			host := badHosts[j]
+			if time.Since(time.Unix(host.BannedAt, 0)) > time.Duration(e.Config.HostBanTime) {
+				log.Printf("GarbageWorker: Unbanning %s for %s\n", host.Address, e.Outbounds[i].Tag)
 
 				e.Outbounds[i].BadHosts = slices.Delete(e.Outbounds[i].BadHosts, j, j+1)
 			}
 		}
 	}
+}
+
+func (e *XrayEngine) PingWorker() {
+	log.Println("PingWorker: startin ping")
+	e.PingAll(30)
 }
 
 func (e *XrayEngine) GetClient(tag string) *http.Client {
@@ -170,6 +185,35 @@ func (e *XrayEngine) Ping(tag string) time.Duration {
 	return time.Since(now)
 }
 
+func (e *XrayEngine) PingAll(stime time.Duration) {
+	var wg sync.WaitGroup
+	log.Println("Waiting for ping results")
+
+	for i, outbound := range e.Outbounds {
+
+		currentIndex := i
+		currentTag := outbound.Tag
+
+		wg.Go(func() {
+			duration := e.Ping(currentTag)
+
+			e.Outbounds[currentIndex].Ping = duration
+
+			log.Printf("[%s] Ping %v\n", currentTag, duration)
+		})
+
+		time.Sleep(stime)
+	}
+
+	wg.Wait()
+	sort.Slice(e.Outbounds, func(i, j int) bool {
+		return e.Outbounds[i].Ping < e.Outbounds[j].Ping
+	})
+	for i := 0; i < 5 && i < len(e.Outbounds); i++ {
+		log.Printf("Top %d: %s - %+v", i+1, e.Outbounds[i].Tag, e.Outbounds[i].Ping)
+	}
+}
+
 func (e *XrayEngine) AddOutbounds(links string) {
 	linkArr := strings.Split(links, "\n")
 
@@ -179,7 +223,6 @@ func (e *XrayEngine) AddOutbounds(links string) {
 	}
 
 	loaded := 0
-	var wg sync.WaitGroup
 	for i, cfg := range outbounds.OutboundConfigs {
 		cfg.SendThrough = nil // fixes infra/conf: unable to send through error somehow
 		outbound, err := cfg.Build()
@@ -204,27 +247,11 @@ func (e *XrayEngine) AddOutbounds(links string) {
 			continue
 		}
 
-		currentIndex := len(e.Outbounds) - 1
-		currentTag := outbound.Tag
-
-		wg.Go(func() {
-			duration := e.Ping(currentTag)
-
-			e.Outbounds[currentIndex].Ping = duration
-
-			log.Printf("[%s] Ping %v\n", currentTag, duration.Seconds())
-		})
-
 		loaded += 1
 	}
-	log.Println("Waiting for ping results")
-	wg.Wait()
-	sort.Slice(e.Outbounds, func(i, j int) bool {
-		return e.Outbounds[i].Ping < e.Outbounds[j].Ping
-	})
-	for i := 0; i < 5 && i < len(e.Outbounds); i++ {
-		log.Printf("Top %d: %s - %v", i+1, e.Outbounds[i].Tag, e.Outbounds[i].Ping)
-	}
+
+	e.PingAll(0)
+
 	log.Printf("Done loading %d out of %d proxies\n", loaded, len(outbounds.OutboundConfigs))
 }
 

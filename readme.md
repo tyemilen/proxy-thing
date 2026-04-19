@@ -14,6 +14,7 @@ proxy-thing /cool/path/to/conf.json
 	"limits": {
 		"banTime": 60,
 		"gcIntervalTime": 60,
+		"pingIntervalTime": 21,
 		"maxTimeoutRetries": 5,
 		"maxResponseRetries": 5,
 		"maxRedirects": 3

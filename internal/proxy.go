@@ -11,43 +11,64 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
+	"dokinar.ik/proxy-thing/internal/xlib"
 	"dokinar.ik/proxy-thing/internal/xray"
 	"github.com/elazarl/goproxy"
 	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/core"
 )
 
-type ProxyLimits struct {
+type ProxyConfig struct {
 	MaxTimeoutRetries  int
 	MaxResponseRetries int
 	MaxRedirects       int
+	RetryOn            []int
 }
 
 type Proxy struct {
 	*goproxy.ProxyHttpServer
 
-	Engine *xray.XrayEngine
-
-	Limits ProxyLimits
+	Engine  *xray.XrayEngine
+	Config  ProxyConfig
+	Clients map[string]string // name : last-used-proxy
 
 	OnFinish func(failedTags []string, tag string, resp *http.Response)
 }
 
-func NewProxy(engine *xray.XrayEngine) *Proxy {
+type ContextUserData struct {
+	Tags   []string
+	Client string
+}
+
+func NewProxy(engine *xray.XrayEngine, config ProxyConfig) *Proxy {
 	gproxy := goproxy.NewProxyHttpServer()
 	gproxy.Verbose = false
+
+	gproxy.Tr = &http.Transport{
+		TLSHandshakeTimeout:   35 * time.Second,
+		ResponseHeaderTimeout: 35 * time.Second,
+		IdleConnTimeout:       35 * time.Second,
+		DisableKeepAlives:     false,
+		TLSClientConfig:       &tls.Config{InsecureSkipVerify: true},
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			dest, err := xray.BuildDestination(network, addr)
+			if err != nil {
+				return nil, err
+			}
+
+			return core.Dial(ctx, engine.Instance, dest)
+		},
+	}
 
 	proxy := &Proxy{
 		ProxyHttpServer: gproxy,
 		Engine:          engine,
-		Limits: ProxyLimits{
-			MaxTimeoutRetries:  5,
-			MaxResponseRetries: 5,
-			MaxRedirects:       3,
-		},
+		Clients:         map[string]string{},
+		Config:          config,
 	}
 
 	gproxy.OnRequest().HandleConnect(goproxy.FuncHttpsHandler(proxy.handleConnect))
@@ -58,6 +79,25 @@ func NewProxy(engine *xray.XrayEngine) *Proxy {
 }
 
 func (proxy *Proxy) handleConnect(host string, ctx *goproxy.ProxyCtx) (*goproxy.ConnectAction, string) {
+	userData := &ContextUserData{
+		Tags: []string{},
+	}
+
+	authHeader := ctx.Req.Header.Get("Proxy-Authorization")
+
+	if authHeader != "" {
+		rawAuth, err := xlib.DecodeBase64Text(ctx.Req.Header.Get("Proxy-Authorization")[6:])
+		if err != nil {
+			log.Println(err)
+		}
+
+		auth := strings.Split(rawAuth, ":")
+		log.Println("user: ", auth)
+		userData.Client = auth[0]
+	}
+
+	ctx.UserData = userData
+
 	if strings.HasSuffix(host, ":443") {
 		return goproxy.MitmConnect, host
 	}
@@ -80,18 +120,29 @@ func (proxy *Proxy) OnRequestFunc(req *http.Request, ctx *goproxy.ProxyCtx) (*ht
 			ResponseHeaderTimeout: 25 * time.Second,
 			IdleConnTimeout:       25 * time.Second,
 			TLSClientConfig:       &tls.Config{InsecureSkipVerify: true},
+			DisableKeepAlives:     true,
 			DialContext: func(dialCtx context.Context, network, addr string) (net.Conn, error) {
 				dest, err := xray.BuildDestination(network, addr)
 				if err != nil {
 					return nil, err
 				}
 
+				data, ok := ctx.UserData.(*ContextUserData)
+				if !ok {
+					data = &ContextUserData{Tags: []string{}}
+					ctx.UserData = data
+				}
+
 				var tag string
-				tags, _ := ctx.UserData.([]string)
 
-				tag = proxy.Engine.PickOutboundTag(addr, tags)
+				if clients := strings.Split(data.Client, "~"); len(clients) > 1 && clients[1] != "" && proxy.Clients[clients[1]] != "" {
+					tag = proxy.Clients[clients[1]]
+					log.Println("USing bc requested ", tag)
+				} else {
+					tag = proxy.Engine.PickOutboundTag(addr, data.Tags)
+				}
 
-				ctx.UserData = append(tags, tag)
+				data.Tags = append(data.Tags, tag)
 
 				dialCtx = session.SetForcedOutboundTagToContext(dialCtx, tag)
 				return core.Dial(dialCtx, proxy.Engine.Instance, dest)
@@ -99,11 +150,11 @@ func (proxy *Proxy) OnRequestFunc(req *http.Request, ctx *goproxy.ProxyCtx) (*ht
 		}
 
 		currentReq := originalReq
-		for redirects := 0; redirects <= proxy.Limits.MaxRedirects; redirects++ {
+		for redirects := 0; redirects <= proxy.Config.MaxRedirects; redirects++ {
 			var resp *http.Response
 			var err error
 
-			for tries := 0; tries <= proxy.Limits.MaxTimeoutRetries; tries++ {
+			for tries := 0; tries <= proxy.Config.MaxTimeoutRetries; tries++ {
 				attemptReq := currentReq.Clone(currentReq.Context())
 				if attemptReq.GetBody != nil {
 					attemptReq.Body, _ = attemptReq.GetBody()
@@ -113,12 +164,13 @@ func (proxy *Proxy) OnRequestFunc(req *http.Request, ctx *goproxy.ProxyCtx) (*ht
 				if err == nil {
 					break
 				}
-				if netErr, ok := err.(net.Error); ok && netErr.Timeout() && tries < proxy.Limits.MaxTimeoutRetries {
+				if netErr, ok := err.(net.Error); ok && netErr.Timeout() && tries < proxy.Config.MaxTimeoutRetries {
 					continue
 				}
 				return nil, err
 			}
 
+			// todo: move to config
 			if resp.StatusCode >= 300 && resp.StatusCode <= 308 && resp.StatusCode != 304 {
 				loc, err := resp.Location()
 				if err != nil {
@@ -153,7 +205,7 @@ func (proxy *Proxy) OnResponseFunc(resp *http.Response, ctx *goproxy.ProxyCtx) *
 	}
 
 	attempt := 1
-	for (resp.StatusCode == 403 || resp.StatusCode == 429) && attempt <= proxy.Limits.MaxResponseRetries {
+	for slices.Contains(proxy.Config.RetryOn, resp.StatusCode) && attempt <= proxy.Config.MaxResponseRetries {
 		resp.Body.Close()
 		newReq := ctx.Req.Clone(ctx.Req.Context())
 		if newReq.GetBody != nil {
@@ -162,7 +214,7 @@ func (proxy *Proxy) OnResponseFunc(resp *http.Response, ctx *goproxy.ProxyCtx) *
 
 		newResp, err := ctx.RoundTrip(newReq)
 
-		allTags, _ := ctx.UserData.([]string)
+		allTags := ctx.UserData.(*ContextUserData).Tags
 		log.Printf("Retrying [%s] -> %s\n", allTags[len(allTags)-1], newReq.Host)
 
 		if err != nil {
@@ -174,20 +226,25 @@ func (proxy *Proxy) OnResponseFunc(resp *http.Response, ctx *goproxy.ProxyCtx) *
 		attempt++
 	}
 
-	allTags, _ := ctx.UserData.([]string)
+	data, _ := ctx.UserData.(*ContextUserData)
 
 	var successTag string
 	var failedTags []string
 
-	if len(allTags) > 0 {
+	if len(data.Tags) > 0 {
 		if resp.StatusCode < 400 {
-			successTag = allTags[len(allTags)-1]
-			failedTags = allTags[:len(allTags)-1]
+			successTag = data.Tags[len(data.Tags)-1]
+			failedTags = data.Tags[:len(data.Tags)-1]
+
+			if data.Client != "" && !strings.Contains(data.Client, "~") {
+				proxy.Clients[data.Client] = successTag
+			}
 		} else {
-			failedTags = allTags
+			failedTags = data.Tags
 		}
 	}
 
+	log.Println(proxy.Clients)
 	if proxy.OnFinish != nil {
 		proxy.OnFinish(failedTags, successTag, resp)
 	}

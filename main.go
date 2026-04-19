@@ -13,9 +13,13 @@ import (
 
 type Config struct {
 	Address string `json:"address"`
-	Limits  struct {
+	Rules   struct {
+		RetryOn []int `json:"retryOn"`
+	} `json:"rules"`
+	Limits struct {
 		BanTime            int `json:"banTime"`
 		GCInterval         int `json:"gcIntervalTime"`
+		PingInterval       int `json:"pingIntervalTime"`
 		MaxTimeoutRetries  int `json:"maxTimeoutRetries"`
 		MaxResponseRetries int `json:"maxResponseRetries"`
 		MaxRedirects       int `json:"maxRedirects"`
@@ -48,15 +52,17 @@ func main() {
 
 	log.Println(config)
 
-	engine, err := xray.NewXrayEngine(xray.XrayLimits{
-		GCIntervalTime: time.Duration(config.Limits.GCInterval) * time.Second,
-		HostBanTime:    time.Duration(config.Limits.BanTime) * time.Second,
+	engine, err := xray.NewXrayEngine(xray.XrayEngineConfig{
+		GCIntervalTime:   time.Duration(config.Limits.GCInterval) * time.Second,
+		HostBanTime:      time.Duration(config.Limits.BanTime) * time.Second,
+		PingIntervalTime: time.Duration(config.Limits.PingInterval) * time.Second,
 	})
 
 	if err != nil {
 		log.Fatalf("xray engine init: %v", err)
 	}
 
+	engine.Start()
 	defer engine.Close()
 
 	internal.InitCerts(config.Paths.Crt, config.Paths.Key)
@@ -65,11 +71,12 @@ func main() {
 
 	engine.AddOutbounds(string(proxies))
 
-	proxy := internal.NewProxy(engine)
-
-	proxy.Limits.MaxRedirects = config.Limits.MaxRedirects
-	proxy.Limits.MaxResponseRetries = config.Limits.MaxResponseRetries
-	proxy.Limits.MaxTimeoutRetries = config.Limits.MaxTimeoutRetries
+	proxy := internal.NewProxy(engine, internal.ProxyConfig{
+		MaxRedirects:       config.Limits.MaxRedirects,
+		MaxResponseRetries: config.Limits.MaxResponseRetries,
+		MaxTimeoutRetries:  config.Limits.MaxTimeoutRetries,
+		RetryOn:            config.Rules.RetryOn,
+	})
 
 	proxy.OnFinish = func(failed []string, gtag string, res *http.Response) {
 		successTag := gtag
@@ -78,7 +85,7 @@ func main() {
 			successTag = "NONE"
 		}
 
-		log.Printf("finished request for %s %s %d, fails: %+v\n", successTag, res.Request.URL.Host, res.StatusCode, failed)
+		log.Printf("finished request for %s %s %d, fails: %+v\n", successTag, res.Request.URL, res.StatusCode, failed)
 
 		for _, tag := range failed {
 			proxy.Engine.BanHostFor(tag, res.Request.URL.Host)
